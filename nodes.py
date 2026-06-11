@@ -37,6 +37,9 @@ DAVE *before* Block Compile puts DAVE outside the swap and it silently no-ops
 ``set_model_unet_function_wrapper``, which the sampler always invokes *outside*
 ``apply_model`` (hence outside the swap) and which also owns a single slot shared
 with Spectrum — both reasons it was moved to a keyed APPLY_MODEL wrapper.
+
+Reference: "Breaking the Lock-in: Diversifying Text-to-Image Generation via
+Representation Modulation", ICML 2026 — https://github.com/daheekwon/DAVE
 """
 
 from __future__ import annotations

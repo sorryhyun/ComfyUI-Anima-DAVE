@@ -90,6 +90,15 @@ This is a faithful port of the in-repo `library/inference/corrections/dave.py`
 (`--dave` CLI path); the DC-mean math is bit-for-bit identical on ComfyUI's
 native 5D `(B,T,H,W,D)` block output.
 
+## Reference
+
+DAVE is introduced in:
+
+> **Breaking the Lock-in: Diversifying Text-to-Image Generation via
+> Representation Modulation**, ICML 2026.
+
+- Paper repo: <https://github.com/daheekwon/DAVE>
+
 ## License
 
 MIT (this node). DAVE method © its authors.
