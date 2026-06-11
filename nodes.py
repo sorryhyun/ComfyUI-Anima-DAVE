@@ -15,20 +15,28 @@ fraction of denoising steps.
 
 Why a MODEL patch (and not a sampler / latent node): DAVE edits *per-block
 intermediate features* gated by *per-step σ*. Neither is reachable from a sampler
-or latent node — it must live inside the model forward. We install it via
-``set_model_unet_function_wrapper``: on each step the wrapper reads the live σ
-schedule from ``transformer_options`` to decide the gate, then (when active)
-registers a post-``forward`` hook on each pooled DiT block, runs ``apply_model``,
-and removes the hooks in a ``finally`` so nothing leaks across runs/seeds. This
-mirrors the in-repo ``library/inference/corrections/dave.py`` math bit-for-bit;
-ComfyUI's native Cosmos/predict2 ``Block.forward`` returns a 5D ``(B,T,H,W,D)``
-tensor, so the DC mean is over the spatial/token dims (all but batch and channel).
+or latent node — it must live inside the model forward. We install it as an
+``APPLY_MODEL`` patcher-extension wrapper (``add_wrapper_with_key``): on each step
+the wrapper reads the live σ schedule from ``transformer_options`` to decide the
+gate, then (when active) binds the live ``diffusion_model`` off the executor,
+registers a post-``forward`` hook on each pooled DiT block, runs the inner
+executor, and removes the hooks in a ``finally`` so nothing leaks across
+runs/seeds. This mirrors the in-repo ``library/inference/corrections/dave.py``
+math bit-for-bit; ComfyUI's native Cosmos/predict2 ``Block.forward`` returns a 5D
+``(B,T,H,W,D)`` tensor, so the DC mean is over the spatial/token dims (all but
+batch and channel).
 
-Caveat: composition with a torch.compile node (e.g. AnimaBlockCompile) is
-**unverified** — block modules are swapped for compiled ``OptimizedModule``s
-*inside* ``apply_model``, after this wrapper installs its hooks, so under compile
-DAVE may silently no-op (fails safe, no corruption). Apply DAVE on the eager model,
-or verify the compiled path on a live run before relying on it.
+Composition with AnimaBlockCompile: **wire DAVE AFTER Anima Block Compile**
+(loader → Block Compile → DAVE → sampler). AnimaBlockCompile swaps each
+``diffusion_model.blocks.{i}`` for a compiled ``OptimizedModule`` *inside* its own
+``APPLY_MODEL`` wrapper. Because patcher wrappers nest in wiring order, DAVE-after
+runs *inside* that swap, so ``blocks[i]`` are the live compiled modules when DAVE
+hooks them — the hook fires in eager after the compiled forward returns. Wiring
+DAVE *before* Block Compile puts DAVE outside the swap and it silently no-ops
+(fails safe, no corruption). An earlier build used
+``set_model_unet_function_wrapper``, which the sampler always invokes *outside*
+``apply_model`` (hence outside the swap) and which also owns a single slot shared
+with Spectrum — both reasons it was moved to a keyed APPLY_MODEL wrapper.
 """
 
 from __future__ import annotations
@@ -130,30 +138,9 @@ class AnimaDAVE:
                         "tooltip": (
                             "Fraction of the early (high-σ) steps DAVE is active. "
                             "KEEP ≤ 0.10 — wider windows garble text/hands far more than "
-                            "extra dose does. Recommended 0.10. Set 0 to use the raw "
-                            "sigma_lo/sigma_hi window instead."
+                            "extra dose does. Recommended 0.10. Set 0 to run on every step."
                         ),
                     },
-                ),
-            },
-            "optional": {
-                "block_lo": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 255, "tooltip": "Lowest block DAVE may touch."},
-                ),
-                "block_hi": (
-                    "INT",
-                    {"default": -1, "min": -1, "max": 255, "tooltip": "Highest block (-1 = last)."},
-                ),
-                "sigma_lo": (
-                    "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                     "tooltip": "Raw σ window low bound — used only when tau = 0."},
-                ),
-                "sigma_hi": (
-                    "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                     "tooltip": "Raw σ window high bound — used only when tau = 0."},
                 ),
             },
         }
@@ -166,25 +153,16 @@ class AnimaDAVE:
         "of early-mid DiT blocks over the first tau fraction of steps."
     )
 
-    def patch(self, model, mask, strength, tau, block_lo=0, block_hi=-1, sigma_lo=0.0, sigma_hi=1.0):
+    def patch(self, model, mask, strength, tau):
         weight = _load_weight(mask)
         num_blocks = weight.shape[0]
 
-        # Block-range cap: zero the mask outside [block_lo, block_hi] (hi=-1 → last).
-        hi = num_blocks - 1 if block_hi < 0 else min(block_hi, num_blocks - 1)
-        lo = max(0, block_lo)
-        capped = weight.copy()
-        if lo > 0:
-            capped[:lo] = 0.0
-        if hi < num_blocks - 1:
-            capped[hi + 1 :] = 0.0
-
-        # atten = (1 − α) = strength · w(ℓ), clamped so α stays in [0, 1].
-        atten = np.clip(float(strength) * capped, 0.0, 1.0)
+        # atten = (1 − α) = strength · w(ℓ), clamped so α stays in [0, 1]. The block
+        # range is baked into the shipped mask (flat blocks 8–18).
+        atten = np.clip(float(strength) * weight, 0.0, 1.0)
         pooled = [(i, float(a)) for i, a in enumerate(atten) if a > 1e-3]
 
         tau_f = float(tau)
-        s_lo, s_hi = float(sigma_lo), float(sigma_hi)
 
         if not pooled:
             logger.info("DAVE: strength=0 or empty mask → no-op passthrough.")
@@ -196,13 +174,26 @@ class AnimaDAVE:
             strength, tau_f, len(pooled), num_blocks, active_idx[0], active_idx[-1],
         )
 
+        from comfy.patcher_extension import WrappersMP
+
         m = model.clone()
 
-        def unet_wrapper(apply_model, args):
-            x, t, c = args["input"], args["timestep"], args["c"]
-            topts = c.get("transformer_options", {})
+        # APPLY_MODEL wrapper (NOT set_model_unet_function_wrapper). The unet
+        # function wrapper is invoked by the sampler *outside* BaseModel.apply_model,
+        # so it runs before AnimaBlockCompile's per-block compile swap (which lives
+        # in an APPLY_MODEL wrapper *inside* apply_model). Hooks installed out there
+        # land on the eager blocks; the compiled OptimizedModules then run without
+        # them → silent no-op. Registering DAVE as its own APPLY_MODEL wrapper lets
+        # it nest *inside* the compile swap when wired AFTER Anima Block Compile, so
+        # blocks[i] are the live (compiled) modules at hook-registration time. It
+        # also stops clobbering Spectrum, which owns the single model_function_wrapper slot.
+        def dave_apply_wrapper(executor, *args, **kwargs):
+            # Mirrors BaseModel.apply_model's positional layout:
+            #   (x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+            t = args[1]
+            topts = args[5] if len(args) > 5 else kwargs.get("transformer_options", {})
 
-            # Decide the σ gate for this forward.
+            # Decide the early-step gate for this forward. tau == 0 → every step.
             if tau_f > 0.0:
                 step, n_steps = _current_step(topts, t)
                 if step is None:  # no schedule published → run every step (safe default)
@@ -211,17 +202,18 @@ class AnimaDAVE:
                     k = max(1, min(n_steps, round(tau_f * n_steps)))
                     gate = step < k
             else:
-                cur = topts.get("sigmas", t)
-                cur0 = float(cur.flatten()[0])
-                gate = s_lo <= cur0 <= s_hi
+                gate = True
 
             if not gate:
-                return apply_model(x, t, **c)
+                return executor(*args, **kwargs)
 
-            dm = m.get_model_object("diffusion_model")
+            # Bind the LIVE diffusion_model at sample time — never a setup-time
+            # captured ref (AnimaBlockCompile's clone(disable_dynamic=True) rebuilds
+            # diffusion_model, which would strand a captured ref on the dead instance).
+            dm = executor.class_obj.diffusion_model
             blocks = getattr(dm, "blocks", None)
             if blocks is None:
-                return apply_model(x, t, **c)
+                return executor(*args, **kwargs)
 
             handles = [
                 blocks[i].register_forward_hook(_dc_hook(a))
@@ -229,14 +221,15 @@ class AnimaDAVE:
                 if i < len(blocks)
             ]
             try:
-                return apply_model(x, t, **c)
+                return executor(*args, **kwargs)
             finally:
                 for h in handles:
                     h.remove()
 
-        m.set_model_unet_function_wrapper(unet_wrapper)
+        m.remove_wrappers_with_key(WrappersMP.APPLY_MODEL, "anima_dave")
+        m.add_wrapper_with_key(WrappersMP.APPLY_MODEL, "anima_dave", dave_apply_wrapper)
         return (m,)
 
 
 NODE_CLASS_MAPPINGS = {"AnimaDAVE": AnimaDAVE}
-NODE_DISPLAY_NAME_MAPPINGS = {"AnimaDAVE": "Anima DAVE (Diversity)"}
+NODE_DISPLAY_NAME_MAPPINGS = {"AnimaDAVE": "Anima DAVE (after compile)"}
