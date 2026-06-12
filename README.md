@@ -47,7 +47,7 @@ Run a seed grid and you'll see same-prompt diversity open up.
 | Input | Default | Notes |
 |-------|---------|-------|
 | `mask` | `dave_alpha.npz` | Per-block pool `w(ℓ)`. Shipped mask is flat **blocks 8–18**. |
-| `strength` | `0.30` | DC removal dose `s = (1−α)`. `0.30` conservative; up to `~0.80` at `tau=0.10` for max diversity. `0` disables. |
+| `strength` | `0.30` | Per-block DC-removal dose `s = (1−α) = strength·w(ℓ)` — **not a linear "more = stronger" knob** ([see below](#what-strength-actually-does-issue-1)). Its effect on *structure* is non-monotonic and often peaks **low** (`~0.05–0.2`); `0.30` is a safe all-round default, `~0.80` removes the most DC at `tau=0.10`. `0` disables. |
 | `tau` | `0.10` | Fraction of early (high-σ) steps DAVE is active. **Keep ≤ 0.10.** `0` = every step. |
 
 ### The one rule that matters
@@ -59,8 +59,38 @@ them. Tighten `tau` first; spend any remaining headroom on `strength`.
 Recommended starting points:
 
 - **Safe / default:** `tau=0.10`, `strength=0.30`
-- **Max diversity:** `tau=0.10`, `strength=0.80`
+- **Most layout diversity:** `tau=0.10`, sweep `strength` **low** first (`0.05 → 0.2`)
+- **Most raw DC removed:** `tau=0.10`, `strength=0.80`
 - **Avoid:** `tau ≥ 0.15` (legibility falls off a cliff)
+
+### What `strength` actually does (issue #1)
+
+`strength` is **not** a global "more = stronger" intensity multiplier. It sets the
+per-block DC-removal dose
+
+```
+(1 − α_ℓ) = strength · w(ℓ)        # fraction of DC removed at pooled block ℓ
+h ← h − (1 − α_ℓ) · μ              # the edit, applied per pooled block
+```
+
+where `w(ℓ)` is the block's pool weight — ranked offline by
+`power_ratio(ℓ) · max(0, DC−AC gap(ℓ))` and binarized in the shipped mask to a flat
+`1.0` over the **early-mid structural band, blocks 8–18** (later detail blocks are
+deliberately excluded).
+
+Why the diversity effect peaks **low** rather than at the top of the range: those
+pooled blocks set the **overall structure**, so even a small dose there reshuffles
+same-prompt *layout* — the change you actually want. Pushing `strength` higher
+removes more DC (more total change) but trades structural diversity for legibility,
+and the network increasingly compensates, so layouts can converge again while text
+and hands degrade. So for fresh layouts, **sweep low strengths first** (`~0.05–0.2`);
+reach for `~0.80` only when you want the maximum DC knocked out and have `tau` pinned
+at `0.10`.
+
+> With a **custom continuous mask** (non-binary `w(ℓ)`), `strength` additionally
+> acts as a soft selector: lowering it drops the lowest-weight blocks below the
+> activation threshold first, so the dose concentrates on the highest-weight
+> (structure-carrying) blocks — the same low-strength sweet spot, by a second route.
 
 ## How it works
 
