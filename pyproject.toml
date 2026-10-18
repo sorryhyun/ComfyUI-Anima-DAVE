@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-anima-dave"
-description = "DAVE (DC Attenuation for diVersity Enhancement) as a drop-in MODEL patch for Anima / Cosmos-predict2 DiT: recover same-prompt sample diversity by attenuating the DC component of early-mid blocks over the first tau fraction of steps. Self-contained — bundles the shipped block-pool mask, pulls no training-repo code."
-version = "0.1.0"
+description = "DAVE (DC Attenuation for diVersity Enhancement) as a drop-in MODEL patch for the Anima / Cosmos-predict2 DiT and MOSS-Image: recover same-prompt sample diversity by attenuating the DC component of early-mid blocks over the first tau fraction of steps. Self-contained — bundles the shipped block-pool masks, pulls no training-repo code."
+version = "0.2.0"
 license = { file = "LICENSE" }
 # torch / numpy ship with any ComfyUI install; listed for a bare `pip install .`.
 dependencies = [
@@ -14,5 +14,5 @@ Repository = "https://github.com/sorryhyun/ComfyUI-Anima-DAVE"
 
 [tool.comfy]
 PublisherId = "sorryhyun"
-DisplayName = "Anima DAVE (Diversity)"
+DisplayName = "Anima / MOSS DAVE (Diversity)"
 Icon = ""

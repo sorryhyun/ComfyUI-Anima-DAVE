@@ -38,6 +38,15 @@ DAVE *before* Block Compile puts DAVE outside the swap and it silently no-ops
 ``apply_model`` (hence outside the swap) and which also owns a single slot shared
 with Spectrum — both reasons it was moved to a keyed APPLY_MODEL wrapper.
 
+MOSS-Image (the ``moss-image`` node's ``MOSSImageTransformer``, detected by its
+``layers`` + ``video_embedder``): a block outputs ``[image (H·W) | text]`` per
+sample, so μ is taken over the image tokens only and only they are edited, and
+the mask's ``exclude_channels`` (MOSS's massive-activation channels, ~99 % of the
+image tokens' mean and identical across seeds and prompts) are left out of μ.
+Shipped pool: blocks 19–30 of 42. With ``SkipLayerGuidanceDiTSimple`` skipping
+block 22 on the uncond pass, that block is replaced and never called there, so
+its hook edits the cond pass alone — as ``library/moss/dave.py`` does.
+
 Reference: "Breaking the Lock-in: Diversifying Text-to-Image Generation via
 Representation Modulation", ICML 2026 — https://github.com/daheekwon/DAVE
 """
@@ -53,23 +62,33 @@ import torch
 logger = logging.getLogger("ComfyUI-Anima-DAVE")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MASK = "dave_alpha.npz"
+AUTO = "auto"
+# Shipped mask per architecture, picked by ``mask="auto"``.
+DEFAULT_MASKS = {"anima": "dave_alpha.npz", "moss": "moss_dave_alpha.npz"}
 
 
 def _list_masks() -> list[str]:
-    """Bundled per-block weight masks (``*.npz`` with a ``weight`` array)."""
-    masks = sorted(f for f in os.listdir(HERE) if f.endswith(".npz"))
-    if DEFAULT_MASK in masks:  # surface the shipped mask first
-        masks = [DEFAULT_MASK] + [m for m in masks if m != DEFAULT_MASK]
-    return masks or [DEFAULT_MASK]
+    """``auto`` plus the bundled per-block weight masks (``*.npz`` with a ``weight`` array)."""
+    return [AUTO] + sorted(f for f in os.listdir(HERE) if f.endswith(".npz"))
 
 
-def _load_weight(mask_file: str) -> np.ndarray:
-    """Load the per-block weight vector w(ℓ) ∈ [0, 1] from a bundled npz."""
+def _load_mask(mask_file: str) -> tuple[np.ndarray, np.ndarray]:
+    """Per-block weight vector w(ℓ) ∈ [0, 1] and the channel indices left out of μ
+    (``exclude_channels``; empty for the Anima mask)."""
     path = os.path.join(HERE, mask_file)
     if not os.path.exists(path):
         raise FileNotFoundError(f"DAVE mask not found: {path}")
-    return np.load(path)["weight"].astype(np.float64)
+    data = np.load(path)
+    exclude = data["exclude_channels"] if "exclude_channels" in data.files else ()
+    return data["weight"].astype(np.float64), np.asarray(exclude, dtype=np.int64)
+
+
+def _arch(diffusion_model) -> str:
+    """``moss`` for the MOSS-Image node's transformer (``layers``, image tokens first),
+    ``anima`` for the Cosmos/predict2 DiT (``blocks``)."""
+    if hasattr(diffusion_model, "layers") and hasattr(diffusion_model, "video_embedder"):
+        return "moss"
+    return "anima"
 
 
 def _dc_hook(atten: float):
@@ -84,6 +103,26 @@ def _dc_hook(atten: float):
         dims = tuple(range(1, output.ndim - 1)) or (1,)
         mu = output.float().mean(dim=dims, keepdim=True)
         return (output.float() - atten * mu).to(output.dtype)
+
+    return hook
+
+
+def _moss_dc_hook(atten: float, n_img: int, keep_cache: dict, exclude: np.ndarray):
+    """MOSS post-``forward`` hook. A block outputs ``(1, H·W + text, D)`` (the node
+    runs each sample alone); μ is the mean over the ``n_img`` image tokens with the
+    massive-activation channels zeroed, and only the image tokens are edited."""
+
+    def hook(_module, _inputs, output: torch.Tensor) -> torch.Tensor:
+        img = output[:, :n_img].float()
+        mu = img.mean(dim=1, keepdim=True)
+        if exclude.size:
+            keep = keep_cache.get(output.device)
+            if keep is None:
+                keep = torch.ones(output.shape[-1], device=output.device)
+                keep[torch.from_numpy(exclude).to(output.device)] = 0.0
+                keep_cache[output.device] = keep
+            mu = mu * keep
+        return torch.cat(((img - atten * mu).to(output.dtype), output[:, n_img:]), 1)
 
     return hook
 
@@ -107,7 +146,7 @@ def _current_step(transformer_options: dict, timestep: torch.Tensor):
 
 
 class AnimaDAVE:
-    """Patch an Anima/Cosmos MODEL with DAVE same-prompt diversity enhancement."""
+    """Patch an Anima/Cosmos or MOSS-Image MODEL with DAVE same-prompt diversity enhancement."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -116,7 +155,13 @@ class AnimaDAVE:
                 "model": ("MODEL",),
                 "mask": (
                     _list_masks(),
-                    {"tooltip": "Per-block pool mask (w(ℓ)). Shipped: flat blocks 8–18."},
+                    {
+                        "tooltip": (
+                            "Per-block pool mask (w(ℓ)). auto = the shipped mask for the "
+                            "model: Anima blocks 8–18 (dave_alpha.npz), MOSS-Image blocks "
+                            "19–30 (moss_dave_alpha.npz)."
+                        )
+                    },
                 ),
                 "strength": (
                     "FLOAT",
@@ -157,11 +202,20 @@ class AnimaDAVE:
     )
 
     def patch(self, model, mask, strength, tau):
-        weight = _load_weight(mask)
+        arch = _arch(model.get_model_object("diffusion_model"))
+        mask_file = DEFAULT_MASKS[arch] if mask == AUTO else mask
+        weight, exclude = _load_mask(mask_file)
         num_blocks = weight.shape[0]
+        if arch == "moss":
+            depth = len(model.get_model_object("diffusion_model").layers)
+            if num_blocks != depth:
+                raise ValueError(
+                    f"DAVE mask {mask_file} has {num_blocks} blocks, the MOSS-Image model "
+                    f"has {depth}; use mask=auto or {DEFAULT_MASKS['moss']}"
+                )
 
         # atten = (1 − α) = strength · w(ℓ), clamped so α stays in [0, 1]. The block
-        # range is baked into the shipped mask (flat blocks 8–18).
+        # range is baked into the shipped masks (Anima 8–18, MOSS 19–30).
         atten = np.clip(float(strength) * weight, 0.0, 1.0)
         pooled = [(i, float(a)) for i, a in enumerate(atten) if a > 1e-3]
 
@@ -173,9 +227,12 @@ class AnimaDAVE:
 
         active_idx = [i for i, _ in pooled]
         logger.info(
-            "DAVE armed: strength=%.3f, tau=%.3f, %d/%d blocks active (%d..%d)",
-            strength, tau_f, len(pooled), num_blocks, active_idx[0], active_idx[-1],
+            "DAVE armed (%s, %s): strength=%.3f, tau=%.3f, %d/%d blocks active (%d..%d), "
+            "%d channels left out",
+            arch, mask_file, strength, tau_f, len(pooled), num_blocks,
+            active_idx[0], active_idx[-1], exclude.size,
         )
+        keep_cache: dict = {}
 
         from comfy.patcher_extension import WrappersMP
 
@@ -214,12 +271,19 @@ class AnimaDAVE:
             # captured ref (AnimaBlockCompile's clone(disable_dynamic=True) rebuilds
             # diffusion_model, which would strand a captured ref on the dead instance).
             dm = executor.class_obj.diffusion_model
-            blocks = getattr(dm, "blocks", None)
+            if arch == "moss":
+                # MOSS latents are packed (B, 128, H/16, W/16): one image token per cell.
+                blocks = dm.layers
+                n_img = args[0].shape[-2] * args[0].shape[-1]
+                make = lambda a: _moss_dc_hook(a, n_img, keep_cache, exclude)  # noqa: E731
+            else:
+                blocks = getattr(dm, "blocks", None)
+                make = _dc_hook
             if blocks is None:
                 return executor(*args, **kwargs)
 
             handles = [
-                blocks[i].register_forward_hook(_dc_hook(a))
+                blocks[i].register_forward_hook(make(a))
                 for i, a in pooled
                 if i < len(blocks)
             ]
@@ -235,4 +299,4 @@ class AnimaDAVE:
 
 
 NODE_CLASS_MAPPINGS = {"AnimaDAVE": AnimaDAVE}
-NODE_DISPLAY_NAME_MAPPINGS = {"AnimaDAVE": "Anima DAVE (after compile)"}
+NODE_DISPLAY_NAME_MAPPINGS = {"AnimaDAVE": "Anima / MOSS DAVE (after compile)"}

@@ -1,7 +1,8 @@
 # ComfyUI-Anima-DAVE
 
 **DAVE** (DC Attenuation for diVersity Enhancement, training-free) as a one-node
-ComfyUI **MODEL patch** for the Anima / Cosmos-`predict2` DiT.
+ComfyUI **MODEL patch** for the Anima / Cosmos-`predict2` DiT and for
+**MOSS-Image** (the [`moss-image`](https://github.com/OpenMOSS/MOSS-Image) node).
 
 Diffusion models often collapse to near-identical layouts across seeds for the
 same prompt. DAVE recovers that diversity by **attenuating the DC component** —
@@ -23,12 +24,12 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/sorryhyun/ComfyUI-Anima-DAVE comfyui-anima-dave
 ```
 
-No extra dependencies (torch + numpy ship with ComfyUI). The block-pool mask is
-bundled (`dave_alpha.npz`).
+No extra dependencies (torch + numpy ship with ComfyUI). The block-pool masks are
+bundled (`dave_alpha.npz` for Anima, `moss_dave_alpha.npz` for MOSS-Image).
 
 ## Usage
 
-Insert **Anima DAVE (after compile)** between your model loader and the KSampler:
+Insert **Anima / MOSS DAVE (after compile)** between your model loader and the KSampler:
 
 ```
 UNETLoader ─▶ Anima DAVE ─▶ KSampler ─▶ …
@@ -46,7 +47,7 @@ Run a seed grid and you'll see same-prompt diversity open up.
 
 | Input | Default | Notes |
 |-------|---------|-------|
-| `mask` | `dave_alpha.npz` | Per-block pool `w(ℓ)`. Shipped mask is flat **blocks 8–18**. |
+| `mask` | `auto` | Per-block pool `w(ℓ)`. `auto` picks the shipped mask for the loaded model: flat **blocks 8–18** on Anima (`dave_alpha.npz`), **blocks 19–30** of 42 on MOSS-Image (`moss_dave_alpha.npz`). |
 | `strength` | `0.30` | Per-block DC-removal dose `s = (1−α) = strength·w(ℓ)` — **not a linear "more = stronger" knob** ([see below](#what-strength-actually-does-issue-1)). Its effect on *structure* is non-monotonic and often peaks **low** (`~0.05–0.2`); `0.30` is a safe all-round default, `~0.80` removes the most DC at `tau=0.10`. `0` disables. |
 | `tau` | `0.10` | Fraction of early (high-σ) steps DAVE is active. **Keep ≤ 0.10.** `0` = every step. |
 
@@ -92,6 +93,32 @@ at `0.10`.
 > activation threshold first, so the dose concentrates on the highest-weight
 > (structure-carrying) blocks — the same low-strength sweet spot, by a second route.
 
+## MOSS-Image
+
+Wire it after the model-side nodes of the `moss-image` example workflow:
+
+```
+MOSS-Image HF Loader ─▶ ModelSamplingSD3 ─▶ SkipLayerGuidanceDiTSimple (22) ─▶ DAVE ─▶ KSampler
+```
+
+`mask=auto`, `strength=0.30`, `tau=0.10` (the defaults) are the MOSS operating
+point too. Differences from Anima, all handled inside the node:
+
+- **Image tokens only.** A MOSS block outputs `[image | text]`; μ is the mean over
+  the image tokens and the text tokens pass through.
+- **Massive channels left out.** On MOSS ~99 % of the image tokens' mean sits in
+  a handful of massive-activation channels (channel 1356 alone is ~1900× the median
+  at block 0) that are identical across seeds and prompts. Removing a fraction of
+  them shifts the block output instead of unlocking it, so the 18 channels listed
+  in the mask's `exclude_channels` are left out of μ.
+- **Pool 19–30.** Measured on MOSS-Image-Base (3 prompts × 8 seeds, cross-seed
+  similarity of the seed-specific residual at the last step): blocks 8–18 alone
+  move it 0.406 → 0.379; 19–30 move it to 0.209, the same as 8–30; adding 31–40
+  gains little and makes the per-seed global tone drift further.
+- **Expect** more varied framing / pose / panel layout, legible text, and slightly
+  looser hands and objects than vanilla; now and then a global attribute (e.g. a
+  sunset sky) drifts on one seed.
+
 ## How it works
 
 DAVE edits *per-block intermediate features* gated by *per-step σ*, so it has to
@@ -118,7 +145,8 @@ down after every `apply_model` call, so nothing leaks across seeds or runs.
 
 This is a faithful port of the in-repo `library/inference/corrections/dave.py`
 (`--dave` CLI path); the DC-mean math is bit-for-bit identical on ComfyUI's
-native 5D `(B,T,H,W,D)` block output.
+native 5D `(B,T,H,W,D)` block output. The MOSS path matches the trainer repo's
+`library/moss/dave.py` bit-for-bit on a block output.
 
 ## Reference
 
