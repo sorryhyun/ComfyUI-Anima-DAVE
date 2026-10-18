@@ -49,7 +49,7 @@ Run a seed grid and you'll see same-prompt diversity open up.
 |-------|---------|-------|
 | `mask` | `auto` | Per-block pool `w(ℓ)`. `auto` picks the shipped mask for the loaded model: flat **blocks 8–18** on Anima (`dave_alpha.npz`), **blocks 19–30** of 42 on MOSS-Image (`moss_dave_alpha.npz`). |
 | `strength` | `0.30` | Per-block DC-removal dose `s = (1−α) = strength·w(ℓ)` — **not a linear "more = stronger" knob** ([see below](#what-strength-actually-does-issue-1)). Its effect on *structure* is non-monotonic and often peaks **low** (`~0.05–0.2`); `0.30` is a safe all-round default, `~0.80` removes the most DC at `tau=0.10`. `0` disables. |
-| `tau` | `0.10` | Fraction of early (high-σ) steps DAVE is active. **Keep ≤ 0.10.** `0` = every step. |
+| `tau` | `0.06` | Fraction of early (high-σ) steps DAVE is active (3 of 50 steps). **Keep ≤ 0.10.** `0` = every step. |
 
 ### The one rule that matters
 
@@ -59,7 +59,7 @@ them. Tighten `tau` first; spend any remaining headroom on `strength`.
 
 Recommended starting points:
 
-- **Safe / default:** `tau=0.10`, `strength=0.30`
+- **Safe / default:** `tau=0.06`, `strength=0.30`
 - **Most layout diversity:** `tau=0.10`, sweep `strength` **low** first (`0.05 → 0.2`)
 - **Most raw DC removed:** `tau=0.10`, `strength=0.80`
 - **Avoid:** `tau ≥ 0.15` (legibility falls off a cliff)
@@ -101,7 +101,7 @@ Wire it after the model-side nodes of the `moss-image` example workflow:
 MOSS-Image HF Loader ─▶ ModelSamplingSD3 ─▶ SkipLayerGuidanceDiTSimple (22) ─▶ DAVE ─▶ KSampler
 ```
 
-`mask=auto`, `strength=0.30`, `tau=0.10` (the defaults) are the MOSS operating
+`mask=auto`, `strength=0.30`, `tau=0.06` (the defaults) are the MOSS operating
 point too. Differences from Anima, all handled inside the node:
 
 - **Image tokens only.** A MOSS block outputs `[image | text]`; μ is the mean over

@@ -107,20 +107,28 @@ def _dc_hook(atten: float):
     return hook
 
 
-def _moss_dc_hook(atten: float, n_img: int, keep_cache: dict, exclude: np.ndarray):
+def _moss_keep(exclude: np.ndarray, dim: int, device) -> torch.Tensor | None:
+    """``(dim,)`` 1/0 channel mask, 0 on the excluded channels; None when none are.
+
+    Built eagerly in the wrapper: under a compiled block, dynamo traces the hook, and
+    a ``torch.from_numpy`` inside it fails its own guard under ``inference_mode``."""
+    if not exclude.size:
+        return None
+    keep = torch.ones(dim, device=device)
+    keep[exclude.tolist()] = 0.0
+    return keep
+
+
+def _moss_dc_hook(atten: float, n_img: int, keep: torch.Tensor | None):
     """MOSS post-``forward`` hook. A block outputs ``(1, H·W + text, D)`` (the node
     runs each sample alone); μ is the mean over the ``n_img`` image tokens with the
-    massive-activation channels zeroed, and only the image tokens are edited."""
+    massive-activation channels zeroed (``keep``), and only the image tokens are
+    edited."""
 
     def hook(_module, _inputs, output: torch.Tensor) -> torch.Tensor:
         img = output[:, :n_img].float()
         mu = img.mean(dim=1, keepdim=True)
-        if exclude.size:
-            keep = keep_cache.get(output.device)
-            if keep is None:
-                keep = torch.ones(output.shape[-1], device=output.device)
-                keep[torch.from_numpy(exclude).to(output.device)] = 0.0
-                keep_cache[output.device] = keep
+        if keep is not None:
             mu = mu * keep
         return torch.cat(((img - atten * mu).to(output.dtype), output[:, n_img:]), 1)
 
@@ -179,14 +187,14 @@ class AnimaDAVE:
                 "tau": (
                     "FLOAT",
                     {
-                        "default": 0.10,
+                        "default": 0.06,
                         "min": 0.0,
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
                             "Fraction of the early (high-σ) steps DAVE is active. "
                             "KEEP ≤ 0.10 — wider windows garble text/hands far more than "
-                            "extra dose does. Recommended 0.10. Set 0 to run on every step."
+                            "extra dose does. Default 0.06. Set 0 to run on every step."
                         ),
                     },
                 ),
@@ -232,7 +240,6 @@ class AnimaDAVE:
             arch, mask_file, strength, tau_f, len(pooled), num_blocks,
             active_idx[0], active_idx[-1], exclude.size,
         )
-        keep_cache: dict = {}
 
         from comfy.patcher_extension import WrappersMP
 
@@ -275,7 +282,8 @@ class AnimaDAVE:
                 # MOSS latents are packed (B, 128, H/16, W/16): one image token per cell.
                 blocks = dm.layers
                 n_img = args[0].shape[-2] * args[0].shape[-1]
-                make = lambda a: _moss_dc_hook(a, n_img, keep_cache, exclude)  # noqa: E731
+                keep = _moss_keep(exclude, dm.video_embedder.out_features, args[0].device)
+                make = lambda a: _moss_dc_hook(a, n_img, keep)  # noqa: E731
             else:
                 blocks = getattr(dm, "blocks", None)
                 make = _dc_hook
